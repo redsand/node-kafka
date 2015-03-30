@@ -1,0 +1,1205 @@
+
+
+//! New code, Copyright 2015 HAWK Network Defense, Inc.
+//! Tim Shelton
+
+
+
+
+#include <v8.h>
+#include <node.h>
+#include <node_buffer.h>
+#include <map>
+#include <iostream>
+#include <stdexcept>
+#include <sstream>
+#include <vector>
+#include <string>
+#include <syslog.h>
+#include <stdarg.h>
+#include <cstdlib>
+#include <limits.h>
+
+#include <rdkafkacpp.h>
+
+using namespace v8;
+using namespace node;
+
+static bool debug_state = false;
+
+static Handle<Value>
+setDebug(const Arguments &args) {
+  HandleScope scope;
+  
+  debug_state = args[0]->BooleanValue();
+  
+  return scope.Close(Undefined());
+}
+  
+static void debug(const char* format, ...) {
+  va_list args;
+  va_start(args, format);
+  if (debug_state) {
+    time_t rawtime;
+    struct tm* timeinfo;
+    char timestamp[80];
+
+    time(&rawtime);
+    timeinfo = localtime(&rawtime);
+    strftime(timestamp, 80, "kafka - %D %H:%M:%S - ", timeinfo);
+    printf(timestamp);
+    vprintf(format, args);
+  }
+  va_end(args);
+}
+
+struct ConfigureBaton {
+
+  // global
+  RdKafka::Conf *conf;
+  RdKafka::Conf *tconf;
+  int mode;
+
+  // producer specific...
+  RdKafka::Producer *producer;
+
+
+  // consumer specific...
+  // RdKafka::Consumer *consumer;
+  // this was only 1 topic at a time, lets go big or go home!!!!
+
+  // lookup array of topics to manage....
+  // topic, partition#
+  std::map <std::string, std::pair<RdKafka::Consumer *, RdKafka::Topic *> > *topicMap;
+
+  bool run;
+  bool pause;
+
+};
+
+struct ConnectBaton {
+  Persistent<Function> callback;
+  bool error;
+  std::string error_message;
+
+  struct ConfigureBaton *config;
+  
+  uv_async_t async;
+};
+
+
+
+struct PollBaton {
+  struct ConfigureBaton *config;
+  uv_async_t async;
+};
+
+void poll_events(void* arg) {
+  PollBaton* baton = static_cast<PollBaton*>(arg);
+  
+  debug("poll_events start\n");
+  if(baton->config->mode == 1) {
+	if(baton->config->producer)
+		baton->config->producer->poll(5000);
+  } else if(baton->config->mode == 2) {
+  } else {
+	debug("Unable to find connection assigned within poll baton, unable to poll");
+  }
+
+  baton->async.data = baton;
+  uv_async_send(&baton->async);
+  debug("poll_events end\n");
+}
+
+
+
+void ConnectAsyncWork(uv_work_t* req) {
+  // no v8 access here!
+  debug("ConnectAsyncWork start\n");
+  ConnectBaton* baton = static_cast<ConnectBaton*>(req->data);
+
+  std::string errstr;
+
+  // mode
+  if(baton->config->mode == 1) {
+	baton->config->producer = RdKafka::Producer::create(baton->config->conf, errstr);
+	if(!baton->config->producer) {
+		baton->error = true;
+		baton->error_message = errstr;
+	}
+  } else {
+	// do nothing...
+  }
+
+  PollBaton* poll_baton = new PollBaton();
+  poll_baton->config = baton->config;
+  poll_baton->async = baton->async;
+  uv_thread_t poll_events_id;
+  uv_thread_create(&poll_events_id, poll_events, poll_baton);
+  
+  debug("ConnectAsyncWork end\n");
+}
+
+void connectFree(uv_handle_t* w) {
+  debug("connectFree start\n");
+  ConnectBaton* baton = (ConnectBaton*)w->data;
+  baton->callback.Dispose();
+  delete baton;
+  uv_unref(w);
+  debug("connectFree end\n");
+}
+
+
+void ConnectAsyncAfter(uv_work_t* req) {
+    HandleScope scope;
+    ConnectBaton* baton = static_cast<ConnectBaton*>(req->data);
+    Persistent<Function> callback = baton->callback;
+
+    debug("ConnectAsyncAfter start\n");
+    if (baton->error) {
+      baton->error = false;
+      debug("ConnectAsyncAfter: error detected\n");
+      Local<Value> err = Exception::Error(String::New(baton->error_message.c_str()));
+      Local<Value> argv[] = { err };
+      debug("Calling callback inside connection...\n");
+      callback->Call(Context::GetCurrent()->Global(), 1, argv);
+      debug("Calling callback inside connection: done...\n");
+    } else {
+
+      Local<Value> argv[] = {
+        Local<Value>::New(Null())
+      };
+
+      debug("Calling callback inside connection...\n");
+      callback->Call(Context::GetCurrent()->Global(), 1, argv);
+      debug("Calling callback inside connection: done...\n");
+    }
+
+    baton->async.data = baton;
+    uv_close((uv_handle_t*)&baton->async, connectFree);
+    debug("ConnectAsyncAfter end\n");
+}
+
+
+// this can never be called because uv_close has been called
+void ConnectAsyncCallback(uv_async_t* w, int revents) {
+  debug("connectAsyncCallback start\n");
+  uv_unref((uv_handle_t*)w);
+
+  // this is a poll baton...
+
+  PollBaton* baton = (PollBaton*)w->data;
+  w->data = 0;
+  if (baton) {
+    delete baton;
+  } else {
+    debug("connectAsyncCallback with no baton");
+  }
+  debug("connectAsyncCallback end\n");
+}
+
+
+// brokers, partition, topic
+static Handle<Value>
+connect(const Arguments &args) {
+  HandleScope scope;
+  
+  Local<Object> obj = args[0]->ToObject();
+  ConfigureBaton *configure_baton = (ConfigureBaton *)(v8::External::Cast(*(obj->GetInternalField(0)))->Value());
+
+  // connect(this._rk, 2, function(err) {
+  ConnectBaton* baton = new ConnectBaton();
+
+  int mode = static_cast<int>(args[1]->NumberValue());
+
+  Local<Function> callback = Local<Function>::Cast(args[2]);
+  baton->callback = Persistent<Function>::New(callback);
+  
+  baton->error = false;
+
+  if(mode != 1 && mode != 2) {
+	// no connect mode provided, wtf
+	// throw error when i learn how
+	Local<Value> err = Exception::Error(String::New("Invalid mode specified, modes are: 'consumer' and 'producer'"));
+	Local<Value> argv[] = { err };
+	baton->callback->Call(Context::GetCurrent()->Global(), 1, argv);
+  	return scope.Close(Undefined());
+  }
+
+  configure_baton->mode = mode;
+
+  baton->config = configure_baton;
+  
+  debug("connecting, brokers already configured...\n");
+  std::string errstr;
+  std::string es;
+
+  // poll thread
+  uv_async_init(uv_default_loop(), &baton->async, ConnectAsyncCallback);
+  uv_ref((uv_handle_t*)&baton->async);
+
+
+  // connect thread
+  uv_work_t* req = new uv_work_t();
+  req->data = baton;
+  int status = uv_queue_work(uv_default_loop(), req, ConnectAsyncWork, (uv_after_work_cb)ConnectAsyncAfter);
+  
+  if (status != 0) {
+    fprintf(stderr, "connect: couldn't queue work");
+    debug("connect: couldn't queue work\n");
+    Local<Value> err = Exception::Error(String::New("Could not queue work"));
+    Local<Value> argv[] = { err };
+    baton->callback->Call(Context::GetCurrent()->Global(), 1, argv);
+    uv_close((uv_handle_t*)&baton->async, connectFree);
+  }  
+  
+  return scope.Close(Undefined());
+}
+
+
+static Handle<Value>
+disconnect(const Arguments &args) {
+  HandleScope scope;
+  debug("disconnect: start...\n");
+
+  Local<Object> obj = args[0]->ToObject();
+
+  // args[1] == cast to rk type
+
+  debug("disconnect: got obj...\n");
+
+  ConfigureBaton *baton = (ConfigureBaton *)(v8::External::Cast(*(obj->GetInternalField(0)))->Value());
+  //debug("disconnect: got connect obj...\n");
+
+  // This will actually be a producer/consumer baton? since connect baton ends
+
+  // we need to really delete our consumer or producer tasks (wherever we've stored them)
+  debug("disconnect: baton lookup...\n");
+
+  if(!baton) {
+	debug("disconnect: no baton found...\n");
+  	return scope.Close(Undefined());
+  }
+
+  if(baton->mode == 1) {
+	debug("disconnect: deleting producer....\n");
+
+	while (baton->producer->outq_len() > 0) {
+		debug("disconnect: waiting for producer to finish....\n");
+		baton->producer->poll(50);
+	}
+  } else if(baton->mode == 2) {
+	// for each topic and partition
+	// stop topic/partition
+	// then poll for 1 second total....
+	debug("disconnect: disconnecting consumer....\n");
+
+	/* signal each consumer thread that we're ending */
+	/* wait for all to be completed */
+
+  }
+
+  RdKafka::wait_destroyed(5000);
+
+  // Local<Value> err = Exception::Error(String::New("Invalid mode specified, modes are: 'consumer' and 'producer'"));
+  Local<Value> argv[] = { };
+
+  Local<Function> callback = Local<Function>::Cast(args[1]);
+  Persistent<Function> callback_p;
+  callback_p = Persistent<Function>::New(callback);
+  callback_p->Call(Context::GetCurrent()->Global(), 0, argv);
+
+  return scope.Close(Undefined());
+}
+
+struct ConsumeBaton {
+  Persistent<Function> callback;
+  Persistent<Object> emitter;
+
+  std::string topic;
+  bool error;
+  std::string error_message;
+  int32_t partition;
+  int64_t offset;
+  int64_t offset_max;
+
+  struct ConfigureBaton *config;
+
+  uv_async_t async;
+};
+
+struct ProduceBaton {
+  Persistent<Function> callback;
+  Persistent<Object> emitter;
+  std::string message;
+  std::string topic;
+  int32_t partition;
+  size_t delivered_length;
+  bool error;
+  std::string error_message;
+
+  struct ConfigureBaton *config;
+  
+  uv_async_t async;
+};
+
+class DeliveryReportCb : public RdKafka::DeliveryReportCb {
+	private:
+		ProduceBaton *baton;
+
+	public:
+		DeliveryReportCb() {
+			this->baton = NULL;
+		}
+
+		void baton_set(ProduceBaton *baton) {
+			this->baton = baton;
+		}
+
+		void dr_cb (RdKafka::Message &message) {
+			// this failed? send notificaiton...
+			debug("Message delivery for (%u bytes): %s", message.len() , message.errstr().c_str());
+			this->baton->async.data = this->baton;
+			uv_async_send(&baton->async);
+		}
+};
+
+class EventCb : public RdKafka::EventCb {
+	private:
+		ConsumeBaton *baton;
+
+	public:
+		EventCb() {
+			this->baton = NULL;
+		}
+
+		void baton_set(ConsumeBaton *baton) {
+			this->baton = baton;
+		}
+
+		void event_cb (RdKafka::Event &event) {
+			debug("EVENT_CB");
+			//debug("Inside event_cb!!!!! %p" , event)
+			switch (event.type()) {
+				case RdKafka::Event::EVENT_ERROR:
+					debug("ERROR (%s): %s", RdKafka::err2str(event.err()).c_str(), event.str().c_str());
+					//if (event.err() == RdKafka::ERR__ALL_BROKERS_DOWN)
+					// get baton is impossible
+
+					// I think we need to be emitting this stuff instead
+					if(this->baton->emitter->IsObject() ) {
+						debug("event_cb/err: emitter is an object\n");
+						Local<Function> emit = Local<Function>::Cast(baton->emitter->Get(String::New("emit"))); 
+						debug("emit is a method %d\n", emit->IsFunction());
+					        Local<Value> argv[] = {
+					          Local<Value>::New(String::New("error")),
+					          Exception::Error(String::New(baton->error_message.c_str()))
+					        };
+					        emit->Call(baton->emitter, 2, argv);
+					} else {
+						this->baton->error = true;
+						this->baton->error_message = RdKafka::err2str(event.err()).c_str();
+					}
+					break;
+				case RdKafka::Event::EVENT_STATS:
+					debug("\"STATS\": %s", event.str().c_str()); 
+					// I think we need to be emitting this stuff instead
+					if(this->baton->emitter->IsObject()) {
+						debug("event_cb/stats: emitter is an object\n");
+						Local<Function> emit = Local<Function>::Cast(baton->emitter->Get(String::New("emit"))); 
+						debug("emit is a method %d\n", emit->IsFunction());
+					        Local<Value> argv[] = {
+					          Local<Value>::New(String::New("stats")),
+					          Local<Value>::New(String::New(event.str().c_str()))
+					        };
+					        emit->Call(baton->emitter, 2, argv);
+					}
+					break;
+				case RdKafka::Event::EVENT_LOG:
+					debug("LOG-%i-%s: %s\n", event.severity(), event.fac().c_str(), event.str().c_str());
+					// I think we need to be emitting this stuff instead
+					if(this->baton->emitter->IsObject()) {
+						debug("event_cb/log: emitter is an object\n");
+						Local<Function> emit = Local<Function>::Cast(baton->emitter->Get(String::New("emit"))); 
+						debug("emit is a method %d\n", emit->IsFunction());
+						if(event.err()) {
+						        Local<Value> argv[] = {
+						          Local<Value>::New(String::New("error")),
+					          	  Exception::Error(String::New( RdKafka::err2str(event.err()).c_str()))
+						        };
+						        emit->Call(baton->emitter, 2, argv);
+						} else {
+						        Local<Value> argv[] = {
+						          Local<Value>::New(String::New("message")),
+						          Local<Value>::New(String::New(event.str().c_str()))
+						        };
+						        emit->Call(baton->emitter, 2, argv);
+						}
+					}
+					break;
+				default:
+					debug("EVENT (%s): %s", RdKafka::err2str(event.err()).c_str(), event.str().c_str());
+					// emit this out for handling
+					// I think we need to be emitting this stuff instead
+					if(this->baton->emitter->IsObject()) {
+						debug("event_cb/default: emitter is an object\n");
+						Local<Function> emit = Local<Function>::Cast(baton->emitter->Get(String::New("emit"))); 
+						debug("emit is a method %d\n", emit->IsFunction());
+						if(event.err()) {
+						        Local<Value> argv[] = {
+						          Local<Value>::New(String::New("error")),
+					          	  Exception::Error(String::New( RdKafka::err2str(event.err()).c_str()))
+						        };
+						        emit->Call(baton->emitter, 2, argv);
+						} else {
+						        Local<Value> argv[] = {
+						          Local<Value>::New(String::New("message")),
+						          Local<Value>::New(String::New(event.str().c_str()))
+						        };
+						        emit->Call(baton->emitter, 2, argv);
+						}
+					}
+					break;
+			}
+
+			this->baton->async.data = baton;
+			uv_async_send(&baton->async);
+		}
+
+		~EventCb() {
+			// deconstructor
+		}
+};
+
+void produceFree(uv_handle_t* w) {
+  debug("produceFree start\n");
+  uv_unref(w);
+  ProduceBaton* baton = (ProduceBaton*)w->data;
+  baton->callback.Dispose();
+  baton->emitter.Dispose();
+  delete baton;
+  debug("produceFree end\n");
+}
+
+
+static void produceAsyncDelivery(uv_async_t* w, int revents) {
+  HandleScope scope;
+  debug("produceAsyncDelivery start\n");
+  
+  ProduceBaton* baton = (ProduceBaton*)w->data;
+  
+  if (baton) {
+    debug("produceAsyncDelivery with baton\n");
+  } else {
+    debug("produceAsyncDelivery without baton\n");
+  }
+  
+  if (baton && baton->emitter->IsObject()) {
+    debug("produceAsyncDelivery: emitter is an object\n");
+    Local<Function> emit = Local<Function>::Cast(baton->emitter->Get(String::New("emit"))); 
+    debug("emit is a method %d\n", emit->IsFunction());
+    if (baton->error) {
+      Local<Value> argv[] = {
+        Local<Value>::New(String::New("error")),
+        Exception::Error(String::New(baton->error_message.c_str()))
+      };
+      emit->Call(baton->emitter, 2, argv);
+    } else {
+      Local<Value> argv[] = {
+        Local<Value>::New(String::New("delivery")),
+        Local<Value>::New(Integer::New(baton->delivered_length))
+      };
+      emit->Call(baton->emitter, 2, argv);
+    }
+  }
+  if (baton) {
+    debug("cleanup produce baton\n");
+    uv_close((uv_handle_t*)&baton->async, produceFree);
+  }
+  debug("produceAsyncDelivery end\n");
+}
+
+void ProduceAsyncWork(uv_work_t* req) {
+  // no v8 access here!
+  std::string errstr;
+
+  debug("ProduceAsyncWork start\n");
+
+  ProduceBaton* baton = static_cast<ProduceBaton*>(req->data);
+  
+  RdKafka::Topic *topic = RdKafka::Topic::create(baton->config->producer, baton->topic, baton->config->tconf, errstr);
+
+  if(!topic) {
+	baton->error = true;
+    	baton->error_message = errstr;
+  } else {
+	  RdKafka::ErrorCode resp = baton->config->producer->produce(topic, baton->partition < 0 ? RdKafka::Topic::PARTITION_UA : baton->partition, RdKafka::Producer::RK_MSG_COPY /* Copy payload */, const_cast<char *>(baton->message.c_str()), baton->message.length(), NULL, NULL);
+
+	  if (resp != RdKafka::ERR_NO_ERROR) {
+	    baton->error = true;
+	    baton->error_message = RdKafka::err2str(resp);
+	    debug("Error %s\n", baton->error_message.c_str());
+	  } else
+		  debug("sent %ld\n", baton->message.size());
+
+	  baton->config->producer->poll(0);
+
+	  delete topic;
+  }
+
+  debug("ProduceAsyncWork end\n");
+}
+
+void ProduceAsyncAfter(uv_work_t* req) {
+  HandleScope scope;
+  ProduceBaton* baton = static_cast<ProduceBaton*>(req->data);
+  Persistent<Function> callback = baton->callback;
+  debug("ProduceAsyncAfter start\n");
+  
+  if (baton->error) {
+    debug("ProduceAsyncAfter: error detected\n");
+    Local<Value> err = Exception::Error(String::New(baton->error_message.c_str()));
+    Local<Value> argv[] = { err };
+    callback->Call(Context::GetCurrent()->Global(), 1, argv);
+  } else {
+    Local<Value> argv[] = {
+      Local<Value>::New(Null())
+    };
+    callback->Call(Context::GetCurrent()->Global(), 1, argv);
+  }
+  
+  debug("ProduceAsyncAfter end\n");
+}
+
+
+static Handle<Value>
+produce(const Arguments &args) {
+  HandleScope scope;
+  
+  ProduceBaton* produce_baton = new ProduceBaton();
+  
+  Local<Object> obj = args[0]->ToObject();
+
+  ConfigureBaton *configure_baton = (ConfigureBaton *)(v8::External::Cast(*(obj->GetInternalField(0)))->Value());
+
+  produce_baton->config = configure_baton;
+  // get connection object, and use this async instead?
+  
+  v8::String::Utf8Value param1(args[1]->ToString());
+  produce_baton->topic = std::string(*param1);
+
+  v8::String::Utf8Value param2(args[2]->ToString());
+  produce_baton->message = std::string(*param2);
+  
+  produce_baton->partition = static_cast<int32_t>(args[3]->NumberValue());
+  
+  Local<Object> emitter = Local<Object>::Cast(args[4]);
+  produce_baton->emitter = Persistent<Object>::New(emitter);
+
+  Local<Function> callback = Local<Function>::Cast(args[5]);
+  produce_baton->callback = Persistent<Function>::New(callback);
+  produce_baton->error = false;
+
+  debug("rk, %p\n", configure_baton->producer);
+  debug("partition %d\n", produce_baton->partition);
+  debug("message, %ld, %s\n", produce_baton->message.length(), produce_baton->message.c_str());
+
+  std::string errstr;
+
+  DeliveryReportCb  dr_cb;
+
+  dr_cb.baton_set(produce_baton);
+
+  if (configure_baton->conf->set("dr_cb", &dr_cb, errstr) != RdKafka::Conf::CONF_OK) {
+    debug("produce: unable to set internal callback, %s", errstr.c_str());
+    Local<Value> err = Exception::Error(String::New(errstr.c_str()));
+    Local<Value> argv[] = { err };
+    produce_baton->callback->Call(Context::GetCurrent()->Global(), 1, argv);
+    return scope.Close(Undefined());
+  }
+
+  uv_async_init(uv_default_loop(), &produce_baton->async, produceAsyncDelivery);
+  uv_ref((uv_handle_t*)&produce_baton->async);
+  
+  uv_work_t* req = new uv_work_t();
+  req->data = produce_baton;
+  int status = uv_queue_work(uv_default_loop(), req, ProduceAsyncWork, (uv_after_work_cb)ProduceAsyncAfter);
+  
+  debug("produce uv_queue_work %d\n", status);
+
+  if (status != 0) {
+    fprintf(stderr, "produce uv_queue_work error\n");
+    debug("produce: couldn't queue work\n");
+    Local<Value> err = Exception::Error(String::New("Could not queue work for produce"));
+    Local<Value> argv[] = { err };
+    produce_baton->callback->Call(Context::GetCurrent()->Global(), 1, argv);
+    uv_close((uv_handle_t*)&produce_baton->async, produceFree);
+  }
+
+  debug("produce: done\n");
+  return scope.Close(Undefined());
+}
+
+
+
+void consumeFree(uv_handle_t* w) {
+  debug("consumeFree start\n");
+  uv_unref(w);
+  ConsumeBaton* baton = (ConsumeBaton*)w->data;
+  baton->callback.Dispose();
+  baton->emitter.Dispose();
+  //baton->workerThread is running stil? should be until close/disconnect
+  delete baton;
+  debug("consumeFree end\n");
+}
+
+static void consumeAsyncReceive(uv_async_t* w, int revents) {
+  HandleScope scope;
+  debug("consumerAsyncReceive start\n");
+  
+  ConsumeBaton* baton = (ConsumeBaton*)w->data;
+  debug("consumeAsyncReceive Topic here: %s\n", baton->topic.c_str());
+  
+  if (baton) {
+    debug("consumerAsyncReceive with baton\n");
+  } else {
+    debug("consumerAsyncReceive without baton\n");
+  }
+  
+    debug("consumeAsyncReceive: emitter is an object\n");
+    Local<Function> emit = Local<Function>::Cast(baton->emitter->Get(String::New("emit"))); 
+    debug("emit is a method %d\n", emit->IsFunction());
+    if (baton->error) {
+      Local<Value> argv[] = {
+        Local<Value>::New(String::New("error")),
+        Exception::Error(String::New(baton->error_message.c_str()))
+      };
+      emit->Call(baton->emitter, 2, argv);
+      return;
+    } else {
+      baton->config->run = true;
+      baton->config->pause = false;
+
+/*
+      Local<Value> argv[] = {
+        Local<Value>::New(String::New("message")),
+        Local<Value>::New(String::New("test json results!!! "))
+      };
+      emit->Call(baton->emitter, 2, argv);
+*/
+    }
+
+  std::string errstr;
+  
+  debug("Opening topic: %s, partition: %d, offset: %ld\n", static_cast<const char *>(baton->topic.c_str()), baton->partition, baton->offset);
+  std::stringstream sstm;
+  sstm << baton->topic << ":" << baton->partition;
+  std::string key = sstm.str();
+
+  debug("Topic key: %s\n", key.c_str());
+
+  RdKafka::Topic *rktopic;
+  RdKafka::Consumer *rkconsumer;
+  std::pair< RdKafka::Consumer *, RdKafka::Topic *> valuePair;
+
+  try {
+  	valuePair = baton->config->topicMap->at(key);
+	rkconsumer = valuePair.first;
+	rktopic = valuePair.second;
+  } 
+  catch (std::out_of_range &e) {
+	debug("No rk topic found... creationg one\n");
+
+	rkconsumer = RdKafka::Consumer::create(baton->config->conf, errstr);
+	if(!rkconsumer) {
+		debug("Unable to create consumer: %s\n", errstr.c_str());
+	        Local<Value> argv[] = {
+	          Local<Value>::New(String::New("error")),
+	          Exception::Error(String::New(errstr.c_str()))
+	        };
+	        emit->Call(baton->emitter, 2, argv);
+	        return;
+	} 
+
+
+  	rktopic = RdKafka::Topic::create(rkconsumer, baton->topic, baton->config->tconf, errstr);
+
+	if(!rktopic) {
+		debug("Unable to create topic on consumer : %s\n", errstr.c_str());
+	        Local<Value> argv[] = {
+	          Local<Value>::New(String::New("error")),
+	          Exception::Error(String::New(errstr.c_str()))
+	        };
+	        emit->Call(baton->emitter, 2, argv);
+	        return;
+	} else {
+		debug("Inserting new topic into map\n");
+		std::pair<RdKafka::Consumer *, RdKafka::Topic *> pair;
+		pair.first = rkconsumer;
+		pair.second = rktopic;
+		baton->config->topicMap->insert(std::pair<std::string, std::pair<RdKafka::Consumer *, RdKafka::Topic *> >(key, pair));
+		debug("Insert completed\n");
+	}
+  }
+
+	if(!rktopic) {
+	  	debug("Unable to open topic.\n");
+	        Local<Value> argv[] = {
+	          Local<Value>::New(String::New("error")),
+	          Exception::Error(String::New(errstr.c_str()))
+	        };
+	        emit->Call(baton->emitter, 2, argv);
+	        return;
+	} 
+
+  	debug("Starting on: %s, partition: %d, offset: %ld\n", static_cast<const char *>(baton->topic.c_str()), baton->partition, baton->offset);
+	RdKafka::ErrorCode resp = rkconsumer->start(rktopic, baton->partition, baton->offset);
+
+	if (resp != RdKafka::ERR_NO_ERROR) {
+	    debug("Error %s\n", baton->error_message.c_str());
+
+            Local<Value> argv[] = {
+              Local<Value>::New(String::New("error")),
+              Exception::Error(String::New(RdKafka::err2str(resp).c_str()))
+            };
+            emit->Call(baton->emitter, 2, argv);
+            return;
+	} 
+
+	debug("Is baton value to run? %s \n", baton->config->run ? "true" : "false");
+
+	// while true, or we're told to stop
+	while(baton->config->run) {
+
+		if(baton->config->pause) {
+			debug("We are set as paused for topic: %s, partition: %d....\n", static_cast<const char *>(baton->topic.c_str()), baton->partition);
+			usleep(1000);
+			continue;
+		}
+
+		debug("Waiting for value from topic: %s, partition: %d....\n", static_cast<const char *>(baton->topic.c_str()), baton->partition);
+		RdKafka::Message *msg = rkconsumer->consume(rktopic, baton->partition, 1000);
+
+		RdKafka::ErrorCode err = msg->err();
+		if(err == RdKafka::ERR__TIMED_OUT) {
+			debug("Message timed out....\n");
+			usleep(500);
+		} else if(err == RdKafka::ERR_NO_ERROR) {
+			/* Real message */
+			baton->offset = msg->offset();
+
+			if(baton->offset_max >= 0 && msg->offset() >= baton->offset_max) {
+				debug("offset max has been reached, ending...: %ld >= %ld\n", msg->offset(), baton->offset_max);
+				baton->config->run = false;
+				break;
+			}
+
+			Handle<ObjectTemplate> templ = ObjectTemplate::New();
+
+			Local<Object> obj = templ->NewInstance();
+
+			obj->Set(Handle<Value>(String::New("topic")), Handle<Value>(String::New(baton->topic.c_str())));
+                        obj->Set(Handle<Value>(String::New("value")), Handle<Value>(String::New(static_cast<const char *>(msg->payload()), msg->len() )));
+			obj->Set(Handle<Value>(String::New("offset")), Handle<Value>(Integer::New(static_cast<int64_t>(msg->offset()))));
+			obj->Set(Handle<Value>(String::New("partition")), Handle<Value>(Integer::New(static_cast<int>(msg->partition()))));
+			obj->Set(Handle<Value>(String::New("length")), Handle<Value>(Integer::New(static_cast<int>(msg->len()))));
+
+			if(msg->key()) {
+				obj->Set(Handle<Value>(String::New("key")), Handle<Value>(String::New(static_cast<const char *>((*msg->key()).c_str()))));
+			}
+
+			Local<Value> argv2[] = {
+				Local<Value>::New(String::New("message")),
+				Local<Value>::New(obj)
+			};
+
+			debug("Emitting message\n");
+			emit->Call(baton->emitter, 2, argv2);
+
+		} else if(err ==  RdKafka::ERR__PARTITION_EOF) {
+			/* Last message */
+			// offset_max set and handle
+			/*
+			if (exit_eof)
+				baton->config->run = false;
+			*/
+			debug("Inside partition eof....\n");
+			debug("If max is >= 0, end\n");
+			if(baton->offset_max >= 0) {
+				baton->config->run = false;
+			}
+		} else {
+			/* Errors */
+			debug("Error consuming..\n");
+			//std::cerr << "Consume failed: " << msg->errstr() << std::endl;
+			debug("Error consuming: %s\n", msg->errstr().c_str());
+			Local<Value> argv3[] = {
+				Local<Value>::New(String::New("error")),
+			        Exception::Error(String::New(msg->errstr().c_str()))
+			};
+			emit->Call(baton->emitter, 2, argv3);
+			baton->config->run = false;
+		}
+		delete msg;
+		rkconsumer->poll(0);
+	}
+
+	rkconsumer->stop(rktopic, baton->partition);
+	rkconsumer->poll(1000);
+
+
+  // tell us which topic is finished!!!
+  Handle<ObjectTemplate> templ = ObjectTemplate::New();
+  Local<Object> obj = templ->NewInstance();
+
+  obj->Set(Handle<Value>(String::New("topic")), Handle<Value>(String::New(baton->topic.c_str())));
+  obj->Set(Handle<Value>(String::New("partition")), Handle<Value>(Integer::New(static_cast<int>(baton->partition))));
+  obj->Set(Handle<Value>(String::New("offset")), Handle<Value>(Integer::New(static_cast<int64_t>(baton->offset))));
+
+  debug("consumeAsyncReceive end, calling callback\n");
+
+    uv_close((uv_handle_t*)&baton->async, consumeFree);
+
+    Local<Value> argv4[] = {
+      Local<Value>::New(String::New("done")),
+      Local<Value>::New( obj )
+    };
+    emit->Call(baton->emitter, 2, argv4);
+    debug("consumeAsyncReceive no local callback, rather emittitting done event\n");
+
+
+}
+
+
+static Handle<Value>
+consume(const Arguments &args) {
+  HandleScope scope;
+  
+  // this isn't being perma saved... should save/storage and track somehow for reference...
+  // this would give us a list of topics we're consuming in parallel
+  ConsumeBaton* consume_baton = new ConsumeBaton();
+  
+  Local<Object> obj = args[0]->ToObject();
+
+  ConfigureBaton *baton = (ConfigureBaton *)(v8::External::Cast(*(obj->GetInternalField(0)))->Value());
+
+  consume_baton->config = baton;
+
+  // get connection object, and use this async instead?
+
+  v8::String::Utf8Value param1(args[1]->ToString());
+  consume_baton->topic = std::string(*param1);
+
+  consume_baton->partition = static_cast<int32_t>(args[2]->NumberValue());
+  if(consume_baton->partition < 0) {
+	debug("Not allowed to set UA partition inside consumer, using first partition\n");
+	consume_baton->partition = 0;
+  }
+
+  consume_baton->offset = static_cast<int64_t>(args[3]->NumberValue());
+
+  if(consume_baton->offset < 0) {
+	debug("Setting offset of stored\n");
+	consume_baton->offset = RdKafka::Topic::OFFSET_STORED;
+  } else if(consume_baton->offset == 0) {
+	debug("Setting offset of beginning\n");
+	consume_baton->offset = RdKafka::Topic::OFFSET_BEGINNING;
+  } // else offset is an exact #
+   else
+	debug("Setting specific offset: %ld\n", consume_baton->offset);
+
+  consume_baton->offset_max = static_cast<int64_t>(args[4]->NumberValue());
+
+  Local<Object> emitter = Local<Object>::Cast(args[5]);
+  consume_baton->emitter = Persistent<Object>::New(emitter);
+  Local<Function> callback = Local<Function>::Cast(args[6]);
+  consume_baton->callback = Persistent<Function>::New(callback);
+  consume_baton->error = false;
+
+  debug("consumer topic, %s\n", consume_baton->topic.c_str());
+  debug("consumer partition %d\n", consume_baton->partition);
+
+  std::string errstr;
+
+  EventCb  event_cb;
+
+  event_cb.baton_set(consume_baton);
+
+  if (baton->conf->set("event_cb", &event_cb, errstr) != RdKafka::Conf::CONF_OK) {
+    debug("consume: unable to set internal callback, %s", errstr.c_str());
+    Local<Value> err = Exception::Error(String::New(errstr.c_str()));
+    Local<Value> argv[] = { err };
+    consume_baton->callback->Call(Context::GetCurrent()->Global(), 1, argv);
+    return scope.Close(Undefined());
+  }
+
+
+  uv_async_init(uv_default_loop(), &consume_baton->async, consumeAsyncReceive);
+
+  debug("Finished setting event cb, setting async receiver loop.\n");
+  debug("consumer topic, %s\n", consume_baton->topic.c_str());
+
+  consume_baton->async.data = consume_baton;
+
+  uv_async_send(&consume_baton->async);
+
+
+
+  // call local callback 
+
+  debug("consume: done\n");
+
+  Local<ObjectTemplate> rk_template = ObjectTemplate::New();
+  Local<Object> topicObj = rk_template->NewInstance();
+  topicObj->Set(Handle<Value>(String::New("topic")), Handle<Value>(String::New(consume_baton->topic.c_str())));
+  topicObj->Set(Handle<Value>(String::New("partition")), Handle<Value>(Integer::New(static_cast<int32_t>(consume_baton->partition))));
+  topicObj->Set(Handle<Value>(String::New("offset")), Handle<Value>(Integer::New(static_cast<int64_t>(consume_baton->offset))));
+
+  Local<Value> argv[] = {
+	topicObj
+  };
+
+  consume_baton->callback->Call(Context::GetCurrent()->Global(), 1, argv);
+  return scope.Close(Undefined());
+
+}
+
+static Handle<Value>
+resume(const Arguments &args) {
+  HandleScope scope;
+  debug("resume: begin\n");
+
+  Local<Object> obj = args[0]->ToObject();
+
+  // only works if its a consumer...
+  ConfigureBaton *baton = (ConfigureBaton *)(v8::External::Cast(*(obj->GetInternalField(0)))->Value());
+  
+  if(!baton) {
+    debug("consume: unable to get connection baton\n");
+    //Local<Value> err = Exception::Error(String::New("Unable to get connection baton"));
+    return scope.Close(Undefined());
+  }
+
+  Local<Function> callback = Local<Function>::Cast(args[1]);
+  Persistent<Function> p_callback = Persistent<Function>::New(callback);
+
+/*
+  for each map iterator, do the following
+*/
+
+  baton->pause = false;
+
+  Local<Value> suc[] = {  Local<Value>::New(Null())  };
+  p_callback->Call(Context::GetCurrent()->Global(), 1, suc);
+  debug("resume: done\n");
+
+  return scope.Close(Undefined());
+}
+
+static Handle<Value>
+pause(const Arguments &args) {
+  HandleScope scope;
+  debug("pause: begin\n");
+
+  Local<Object> obj = args[0]->ToObject();
+
+  // only works if its a consumer...
+  ConfigureBaton *baton = (ConfigureBaton *)(v8::External::Cast(*(obj->GetInternalField(0)))->Value());
+  
+  if(!baton) {
+    debug("consume: unable to get connection baton\n");
+    //Local<Value> err = Exception::Error(String::New("Unable to get connection baton"));
+    return scope.Close(Undefined());
+  }
+
+  Local<Function> callback = Local<Function>::Cast(args[1]);
+  Persistent<Function> p_callback = Persistent<Function>::New(callback);
+
+  baton->pause = true;
+
+  Local<Value> suc[] = {  Local<Value>::New(Null())  };
+  p_callback->Call(Context::GetCurrent()->Global(), 1, suc);
+  debug("pause: done\n");
+
+  return scope.Close(Undefined());
+}
+
+static Handle<Value>
+stop(const Arguments &args) {
+  HandleScope scope;
+  debug("stop: begin\n");
+
+  Local<Object> obj = args[0]->ToObject();
+
+  // only works if its a consumer...
+  ConfigureBaton *baton = (ConfigureBaton *)(v8::External::Cast(*(obj->GetInternalField(0)))->Value());
+  
+  if(!baton) {
+    debug("consume: unable to get connection baton\n");
+    //Local<Value> err = Exception::Error(String::New("Unable to get connection baton"));
+    return scope.Close(Undefined());
+  }
+
+  Local<Function> callback = Local<Function>::Cast(args[1]);
+  Persistent<Function> p_callback = Persistent<Function>::New(callback);
+
+/*
+  for each map iterator, do the following
+*/
+
+  typedef std::map<std::string, std::pair<RdKafka::Consumer *, RdKafka::Topic *> >::const_iterator it_type;
+
+  for(it_type iterator = baton->topicMap->begin(); iterator != baton->topicMap->end(); iterator++) {
+    debug("Getting partition from key: %s\n", iterator->first.c_str());
+    std::string partition_str = iterator->first.substr( iterator->first.find(":") + 1, iterator->first.length() );
+    debug("Stopping partition %s for topic %s\n", partition_str.c_str(), iterator->second.second->name().c_str());
+    iterator->second.first->stop(iterator->second.second, strtol(partition_str.c_str(), 0, 0));
+  }
+
+
+  baton->run = false;
+
+  Local<Value> suc[] = {  Local<Value>::New(Null())  };
+  p_callback->Call(Context::GetCurrent()->Global(), 1, suc);
+  debug("stop: done\n");
+
+  return scope.Close(Undefined());
+}
+
+
+
+static Handle<Value>
+initialize(const Arguments &args) {
+  HandleScope scope;
+  std::string errstr;
+
+  debug("Initializing...\n");
+
+  ConfigureBaton *configure_baton = new ConfigureBaton();
+
+  configure_baton->conf = RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL);
+  configure_baton->tconf = RdKafka::Conf::create(RdKafka::Conf::CONF_TOPIC);
+  configure_baton->topicMap = new std::map <std::string, std::pair<RdKafka::Consumer *, RdKafka::Topic *> >;
+
+
+  // set snappy by default! 
+  if (configure_baton->conf->set("compression.codec", "snappy", errstr) != RdKafka::Conf::CONF_OK) {
+	std::string es;
+	debug("Error: %s", errstr.c_str());
+	es = "Unable to specify default compression codec: 'snappy': ";
+	es.append(errstr);
+
+	Local<Value> err = Exception::Error(String::New(es.c_str()));
+	// should do something about error to inform the user...
+	// now we just return nuffin to show something bad happened
+
+	delete configure_baton->tconf;
+	delete configure_baton->conf;
+	delete configure_baton;
+
+  	return scope.Close(Undefined());
+  }
+  
+  // build our global struct to hold our tracking values....
+  // begin by generating config/topic config
+
+  debug("Saving our object...\n");
+
+  Local<ObjectTemplate> rk_template = ObjectTemplate::New();
+  rk_template->SetInternalFieldCount(1);
+  Local<Object> obj = rk_template->NewInstance();
+  obj->SetInternalField(0, v8::External::New((void *)configure_baton));
+
+  // we have our configuration baton!!
+
+  debug("Initialization completed...\n");
+  return scope.Close( obj );
+}
+
+static Handle<Value>
+configure(const Arguments &args) {
+  HandleScope scope;
+
+  Local<Object> obj = args[0]->ToObject();
+  ConfigureBaton *baton = (ConfigureBaton *)(v8::External::Cast(*(obj->GetInternalField(0)))->Value());
+
+
+  // arg1 is string
+  v8::String::Utf8Value param1(args[1]->ToString());
+  std::string key = std::string(*param1);
+
+  // arg2 convert to string and set value
+  v8::String::Utf8Value param2(args[2]->ToString());
+  std::string value = std::string(*param2);
+
+  std::string errstr;
+
+  debug("Configuring %s: %s\n", key.c_str(), value.c_str());
+
+  if (baton->conf->set(key.c_str(), value.c_str(), errstr) != RdKafka::Conf::CONF_OK) {
+	debug("Error configuring: %s", errstr.c_str());
+  	std::string es;
+	es = "Unable to specify configuration key '";
+	es.append(key);
+	es.append("': ");
+	es.append(errstr);
+	Local<Value> err = Exception::Error(String::New(es.c_str()));
+  	return scope.Close( err );
+  }
+
+  return scope.Close(Undefined());
+}
+
+static Handle<Value>
+topic_configure(const Arguments &args) {
+  HandleScope scope;
+
+  Local<Object> obj = args[0]->ToObject();
+  ConfigureBaton *baton = (ConfigureBaton *)(v8::External::Cast(*(obj->GetInternalField(0)))->Value());
+
+  // arg1 is string
+  v8::String::Utf8Value param1(args[1]->ToString());
+  std::string key = std::string(*param1);
+
+  // arg2 convert to string and set value
+  v8::String::Utf8Value param2(args[2]->ToString());
+  std::string value = std::string(*param2);
+
+  std::string errstr;
+
+  debug("Topic Configuring %s: %s\n", key.c_str(), value.c_str());
+  if (baton->tconf->set(key.c_str(), value.c_str(), errstr) != RdKafka::Conf::CONF_OK) {
+	debug("Topic Error configuring: %s", errstr.c_str());
+  	std::string es;
+	es = "Unable to specify topic configuration key '";
+	es.append(key);
+	es.append("': ");
+	es.append(errstr);
+	Local<Value> err = Exception::Error(String::New(es.c_str()));
+  	return scope.Close( err );
+  }
+
+  return scope.Close(Undefined());
+}
+
+extern "C" void init(Handle<Object> target) {
+  HandleScope scope;
+  
+  // Set up a message delivery report callback.
+  // It will be called once for each message, either on succesful delivery to broker,
+  // or upon failure to deliver to broker.
+  
+  NODE_SET_METHOD(target, "setDebug", setDebug);  
+  NODE_SET_METHOD(target, "initialize", initialize);
+  NODE_SET_METHOD(target, "configure", configure);
+  NODE_SET_METHOD(target, "topic_configure", topic_configure);
+  NODE_SET_METHOD(target, "connect", connect);
+  NODE_SET_METHOD(target, "disconnect", disconnect);
+  NODE_SET_METHOD(target, "produce", produce);
+  NODE_SET_METHOD(target, "consume", consume);
+  NODE_SET_METHOD(target, "pause", pause);
+  NODE_SET_METHOD(target, "resume", resume);
+  NODE_SET_METHOD(target, "stop", stop);
+}
+
+NODE_MODULE(rdkafkaBinding, init);

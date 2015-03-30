@@ -1,0 +1,10 @@
+README.html
+tags
+build
+src/.lock-wscript
+deps/librdkafka/dist
+deps/librdkafka/*.o
+deps/librdkafka/*.lo
+deps/librdkafka/.deps
+deps/librdkafka/.libs
+examples
